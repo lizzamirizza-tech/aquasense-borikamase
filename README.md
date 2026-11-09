@@ -110,6 +110,9 @@ aquasense-borikamase/
 │       ├── PH_Sensor_Test.ino        ← pH sensor test program
 │       ├── TDS_Sensor_Test.ino       ← TDS sensor test program
 │       └── Turbidity_Sensor_Test.ino ← turbidity sensor test program
+├── Node-RED/
+│   └── flows/
+│       └── aquasense_flows.json      ← Node-RED flow export (with placeholders)
 └── website/                          ← AquaSense website (React + Vite)
     ├── public/                       ← favicon
     ├── src/
@@ -133,8 +136,6 @@ aquasense-borikamase/
     └── vite.config.js                ← Vite configuration and proxy to Node-RED
 ```
 
-> The Node-RED flow export is not in the repository yet. The [Node-RED Backend](#6-node-red-backend) section describes the flow as currently deployed.
-
 ---
 
 ## 4. Technology Stack
@@ -144,7 +145,7 @@ aquasense-borikamase/
 | Microcontroller | ESP32 (Arduino framework, Arduino IDE) |
 | ESP32 libraries | `WiFi`, `HTTPClient`, `Wire`, `esp_sntp` (ESP32 core), `LiquidCrystal_I2C`, `PubSubClient` |
 | Messaging | MQTT (Mosquitto broker, port 1883) |
-| Backend | Node-RED |
+| Backend | Node-RED (developed with Node-RED 4.1.8) |
 | Node-RED add-on nodes | `node-red-node-mysql`, `node-red-contrib-telegrambot`, `node-red-dashboard` |
 | Database | MySQL (database `aquasense`, time zone `+08:00`) |
 | Notifications | Telegram Bot API |
@@ -232,7 +233,7 @@ The ESP32 does **not** apply a Kalman Filter. It sends unfiltered values. The Ka
 
 The LCD shows `pH:<x.x> TDS:<x>` on line 1 and `Turb:<x.x> NTU` on line 2.
 
-> The ESP32 uses these quality results only for its LEDs, the Google Sheets log, and its MQTT message. Node-RED ignores the `water_quality` value sent by the ESP32 and classifies the reading again from the Kalman-filtered values (see [6.3](#63-processing-pipeline-aquasense-tab)).
+> The ESP32 uses these quality results only for its LEDs, the Google Sheets log, and its MQTT message. Node-RED ignores the `water_quality` value sent by the ESP32 and classifies the reading again from the Kalman-filtered values (see [6.7](#67-quality-check)).
 
 ### 5.8 Outgoing Data
 
@@ -277,18 +278,30 @@ All three programs work the same way:
 
 ## 6. Node-RED Backend
 
-### 6.1 Overview
+### 6.1 Role in the Architecture
 
-The Node-RED flow has two tabs:
+Node-RED is the backend of AquaSense-Borikamase. It:
+
+- receives the raw sensor readings from the ESP32 over MQTT,
+- validates them and applies the Kalman Filter,
+- classifies the water quality from the filtered values,
+- stores every reading in MySQL,
+- pushes each reading to the website over WebSocket,
+- sends Telegram notifications when the status changes,
+- serves the REST API that the website uses for history, statistics, health and administration.
+
+The flow is exported in [`Node-RED/flows/aquasense_flows.json`](Node-RED/flows/aquasense_flows.json). It has two tabs:
 
 | Tab | Content |
 |---|---|
-| **Aquasense** | MQTT input, validation, Kalman Filter, quality check, MySQL storage, WebSocket output, Telegram notifications, runtime trackers, a latency test branch, the legacy `/api/water/latest` and `/api/water/history` endpoints, and a manual historical replay. |
-| **AquaSense API** | Startup configuration and database setup, an authentication guard, and the public and admin REST API used by the website. |
+| **Aquasense** | MQTT input, JSON parsing, validation, Kalman Filter, quality check, MySQL storage, WebSocket output, Telegram notifications, runtime trackers, a latency test branch, the `/api/water/latest` and `/api/water/history` endpoints, and a manual historical replay. |
+| **AquaSense API** | Startup configuration and database setup, the authentication guard, and the public and admin REST API used by the website. |
+
+> The published flow uses placeholders for a few sensitive values. See [6.14](#614-placeholders-in-the-published-flow).
 
 ### 6.2 System Configuration
 
-At startup the node **"Set AquaSense config"** stores the deployment settings in Node-RED global context. These values contain no secrets and are exposed to the website through `GET /api/config`:
+At startup the function node **"Set AquaSense config"** stores the deployment settings in Node-RED global context. These settings contain no secrets and are available to the website through `GET /api/config`.
 
 | Setting | Value |
 |---|---|
@@ -296,11 +309,11 @@ At startup the node **"Set AquaSense config"** stores the deployment settings in
 | Location | Desa Borikamase, Maros Baru |
 | Time zone | `Asia/Makassar` (WITA, UTC+08:00) |
 | Sampling interval | 60 s |
-| Freshness threshold | 180 s (after this a reading is stale, which is 3 missed samples) |
+| Freshness threshold | 180 s (a reading older than this is "stale", which is 3 missed samples) |
 | MQTT topic | `aquasense/borikamase/water` |
 | Monitoring sessions (WITA) | Pagi 08:00–11:00, Siang 13:00–16:00, Sore 16:00–19:00. Readings outside these windows are labelled "Di luar sesi". |
 | Telegram cooldown | 300 s |
-| Admin authentication | Session lifetime 12 h, lockout after 5 failed logins for 10 min, minimum password length 8 |
+| Admin authentication | Session lifetime 12 h, lockout for 10 min after 5 failed logins, minimum password length 8 |
 | History limits | Max page size 200, export limit 100,000 rows |
 
 ### 6.3 Processing Pipeline (Aquasense tab)
@@ -308,6 +321,7 @@ At startup the node **"Set AquaSense config"** stores the deployment settings in
 ```mermaid
 flowchart LR
     IN["MQTT in<br/>aquasense/borikamase/water"] --> J["JSON"]
+    IN --> TM["Track MQTT message"]
     J --> VAL["Validation Data"]
     J --> LAT["Calculate Latency<br/>(test branch)"]
     VAL --> KAL["Kalman Filter"]
@@ -319,14 +333,24 @@ flowchart LR
     TS --> RT["Notification: retry"] --> LOG[("notification_log")]
 ```
 
-**1. Validation Data**
+### 6.4 MQTT Input from the ESP32
 
-The reading is dropped (with a warning in Node-RED) if any of these is true:
+- The **`mqtt in`** node "ESP32 AquaSense" subscribes to `aquasense/borikamase/water` with **QoS 0**. It uses the broker configuration "Mosquitto AquaSense" on port **1883**, without TLS.
+- Each message is counted by **"Track MQTT message"**. The count and the time of the last message feed `/api/health` and `/api/admin/system`.
+- The ESP32 payload looks like this (see [5.8](#58-outgoing-data)):
 
-- The payload is not an object.
-- `ph`, `tds` or `turbidity` is missing.
-- Any value is not a finite number.
-- pH is outside 0–14.
+  ```json
+  { "ph": 7.12, "tds": 245, "turbidity": 3.40, "sensor_status": "SUCCESS", "water_quality": "GOOD", "timestamp_sent": 1762675200000 }
+  ```
+
+### 6.5 JSON Parsing and Validation
+
+The **`json`** node turns the MQTT message into an object. The **"Validation Data"** function then drops the reading, with a warning in Node-RED, if any of these is true:
+
+- the payload is not an object,
+- `ph`, `tds` or `turbidity` is missing,
+- any value is not a finite number,
+- pH is outside 0–14,
 - TDS or turbidity is negative.
 
 Valid readings are rebuilt as:
@@ -338,9 +362,11 @@ ph_raw, tds_raw, turbidity_raw
 sensor_status  = value from the ESP32 (or "UNKNOWN" if missing)
 ```
 
-**2. Kalman Filter**
+The ESP32's own `water_quality` and `timestamp_sent` values are not passed on to the main pipeline. Each valid reading is also counted by **"Track valid reading"**.
 
-A one-dimensional Kalman Filter is applied separately to each parameter. Its state is kept in the node's context.
+### 6.6 Kalman Filter
+
+The **"Kalman Filter"** function applies a separate one-dimensional Kalman Filter to each parameter. Its state is stored in the node's context.
 
 | Parameter | Process noise **Q** | Measurement noise **R** |
 |---|---|---|
@@ -348,14 +374,17 @@ A one-dimensional Kalman Filter is applied separately to each parameter. Its sta
 | TDS | 10 | 20 |
 | Turbidity | 0.1 | 1 |
 
-- Initial estimate: the first measurement received. Initial error covariance: `P = 1`.
+- The first measurement received becomes the initial estimate. The initial error covariance is `P = 1`.
 - For each new reading:
-  - Prediction: `P = P + Q`
-  - Gain: `K = P / (P + R)`
-  - Update: `x = x + K·(z − x)`, then `P = (1 − K)·P`
+  - prediction: `P = P + Q`
+  - gain: `K = P / (P + R)`
+  - update: `x = x + K·(z − x)`, then `P = (1 − K)·P`
 - Results are rounded to 2 decimals as `ph_filtered`, `tds_filtered` and `turbidity_filtered`.
+- **"Filtered Data (Format)"** then builds the final record with raw and filtered values next to each other.
 
-**3. Quality Check** — uses the **filtered** values:
+### 6.7 Quality Check
+
+The **"Quality Check"** function classifies the water using the **filtered** values:
 
 | Order | Condition | Result |
 |---|---|---|
@@ -363,72 +392,118 @@ A one-dimensional Kalman Filter is applied separately to each parameter. Its sta
 | 2 | 300 ≤ TDS < 600 ppm **or** 5 ≤ turbidity < 50 NTU | `WARNING` |
 | 3 | Any other case | `DANGER` |
 
-**4. Outputs**
+This is the only classification that is stored and shown on the website.
 
-- **MySQL**: inserts one row into `water_quality` with `device_id`, `timestamp` (MySQL `NOW()`, WITA), the raw and filtered values for each parameter, `sensor_status` and `water_quality`.
-- **WebSocket** (`/ws/aquasense`): sends the processed reading as JSON to all connected website clients, with a `session` field (Pagi / Siang / Sore / Di luar sesi) taken from the WITA timestamp.
-- **Telegram**: see [6.4](#64-telegram-notifications).
+### 6.8 MySQL Storage
 
-**5. Latency test branch — Calculate Latency**
-
-This test branch is separate from the main pipeline. It compares the ESP32's `timestamp_sent` with the time Node-RED receives the message:
-
-- It rejects messages with a missing or invalid timestamp.
-- It treats differences above 1000 ms as a clock mismatch.
-- It keeps running count, average, minimum and maximum latency.
-- Results go to the node status and a debug output only.
-
-**6. Runtime trackers**
-
-These count received MQTT messages and valid readings, and track node status. The counts feed `/api/health` and `/api/admin/system`.
-
-### 6.4 Telegram Notifications
-
-- **Sent only when the state changes**: the first classified reading, a change in water quality (in any direction), a sensor reporting an error, or a sensor recovering from an error. Repeated identical readings never send a message.
-- **Cooldown of 300 s** between notifications to prevent flapping around a threshold. A sensor error skips the cooldown, unless the previous delivery failed.
-- **Message content**: status (🟢 GOOD / 🟡 WARNING / 🔴 DANGER), the reason, the filtered pH, TDS and turbidity values, a recommended action, the location ("Sumur Borikamase") and the measurement time in WITA.
-- **Retry**: up to 3 attempts, with waits of 15 s and then 45 s. Every result is written to the `notification_log` table as `SENT` or `FAILED`. After a restart, the last notified state is restored from the most recent delivered log entry.
-- **Test message**: `POST /api/admin/telegram/test`, available on the website's Telegram page.
-- **Historical replay** (manual, through inject nodes): re-sends past status events from stored readings, 5 per run.
-
-### 6.5 Database
-
-- MySQL database `aquasense` on `127.0.0.1:3306`, connection time zone `+08:00`.
-- `water_quality` holds the sensor readings. It must already exist. At startup the flow only adds the index `idx_water_quality_timestamp`.
-- At startup the flow also creates these tables if they do not exist, retrying every 60 s while MySQL is unreachable:
+- **"Prepare MySQL"** inserts one row into the `water_quality` table with:
+  - `device_id`
+  - `timestamp` (MySQL `NOW()`, which is WITA through the connection time zone `+08:00`)
+  - `ph_raw`, `ph_filtered`, `tds_raw`, `tds_filtered`, `turbidity_raw`, `turbidity_filtered`
+  - `sensor_status` and `water_quality`
+- Database: `aquasense` on `127.0.0.1:3306`, through the MySQL configuration node "MySQL AquaSense" (charset `utf8mb4`).
+- **The `water_quality` table must already exist.** At startup the flow only adds the index `idx_water_quality_timestamp` if it is missing.
+- At startup, **"Setup: next statement"** also creates these tables if they do not exist. While MySQL is unreachable, it retries every 60 s.
 
 | Table | Purpose |
 |---|---|
-| `users` | Administrator accounts |
+| `users` | Administrator accounts (an initial `admin` account is created only when the table is empty) |
 | `user_sessions` | Login sessions |
 | `notification_log` | Telegram delivery log |
 | `admin_audit_log` | Audit log of admin actions |
 
-### 6.6 Authentication
+### 6.9 WebSocket Communication with the Website
 
-- Passwords are hashed with **scrypt** (Node.js `crypto`) and compared with `timingSafeEqual`.
-- Logging in creates a server-side session, sent as an **HttpOnly** cookie. The website never stores tokens or passwords.
-- Admin endpoints go through the "auth guard" link call, which returns `401` without a valid session.
+- **"Format WebSocket"** adds a `session` field (Pagi / Siang / Sore / Di luar sesi) based on the WITA hour of the reading, then converts the record to JSON.
+- The **`websocket out`** node sends it to every client connected to the listener **`/ws/aquasense`**. The website receives each new reading this way within moments of the ESP32 publishing it.
+- The number of connected WebSocket clients is tracked from the node status and reported by `/api/admin/system`.
 
-### 6.7 REST API and WebSocket
+### 6.10 Telegram Notifications
 
-**WebSocket:** `/ws/aquasense` — pushes each processed reading in real time.
+- **"Switch Alert"** sends each classified reading to **"Notification: dedup"**.
+- **Notifications are sent only when the state changes:**
+  - the first classified reading,
+  - a change in water quality (in any direction),
+  - a sensor reporting an error,
+  - a sensor recovering from an error.
 
-**Public endpoints:**
+  Repeated identical readings never send a message.
+- **Cooldown of 300 s** between notifications prevents flapping around a threshold. A sensor error skips the cooldown, unless the previous delivery failed.
+- **"Prepare Telegram"** builds the message. It contains:
+  - the status (🟢 GOOD / 🟡 WARNING / 🔴 DANGER) and the reason,
+  - the filtered pH, TDS and turbidity values,
+  - a recommended action,
+  - the location ("Sumur Borikamase") and the measurement time in WITA.
+- **"Notification: retry"** makes up to 3 attempts, waiting 15 s and then 45 s between them. Every result is written to `notification_log` as `SENT` or `FAILED`. After a Node-RED restart, the last notified state is restored from the most recent delivered log entry.
+- **Test message:** `POST /api/admin/telegram/test` sends one message through the same path as real notifications.
+- **Historical replay** (manual, using two inject nodes "Replay: preview" and "Replay: send next 5") re-sends past status events from stored readings, 5 per run.
+
+### 6.11 Latency Test Branch and Runtime Trackers
+
+- **"Calculate Latency"** is a test branch, separate from the main pipeline. It compares the ESP32's `timestamp_sent` with the time Node-RED receives the message:
+  - it rejects messages with a missing or invalid timestamp,
+  - it treats differences above 1000 ms as a clock mismatch,
+  - it keeps a running count, average, minimum and maximum latency,
+  - results go only to the node status and a debug output.
+- **"Track node status"** records the status of the MQTT input (connected / disconnected), the WebSocket output (number of clients), and the Telegram sender. These values are reported by `/api/health` and `/api/admin/system`.
+
+### 6.12 REST API
+
+All responses are JSON with `success` and either `data` or `message`. While the configuration is still loading, endpoints answer `503`. The `/api/water/latest` and `/api/water/history` endpoints answer `503` when MySQL is unreachable.
+
+#### Health API — `GET /api/health`
+
+Reads the timestamp of the newest stored reading and reports the state of the whole system:
+
+| Field | Description |
+|---|---|
+| `api.status`, `node_red.status`, `node_red.started_at` | API and Node-RED status, and when the flow started |
+| `database.status` | `connected` or `unreachable` |
+| `mqtt.status`, `mqtt.last_message_at` | MQTT input status and time of the last message |
+| `latest_reading_at`, `latest_reading_source` | Time of the newest reading. The source is `database`, or `node-red` (in memory) when MySQL is down. |
+| `data_age_seconds` | Age of the newest reading |
+| `freshness` | `fresh` (age ≤ 180 s), `stale`, or `none` (no readings) |
+| `freshness_threshold_seconds`, `sampling_interval_seconds` | Values from the system configuration |
+
+The website polls this endpoint every 15 s to show **LIVE / WAITING FOR DATA / OFFLINE**.
+
+#### History Series API — `GET /api/water/series`
+
+Returns stored readings, oldest first, for the charts and the history views.
+
+| Parameter | Values |
+|---|---|
+| `range` | `15m`, `1h` (default), `24h` (relative to MySQL `NOW()`), `all`, or `custom` |
+| `from`, `to` | `YYYY-MM-DD`, required for `range=custom`. Both are WITA calendar days, inclusive. |
+| `max` | Maximum number of points returned. Default 1500, limited to 100–5000. |
+
+- If the period holds more rows than `max`, every k-th stored reading is returned, plus the newest one. Values are **never averaged or interpolated**. This thinning is for drawing charts only; `/api/water/metrics` always uses every row.
+- The response `data` contains:
+  - `range`, `from`, `to`
+  - `total` and `returned` (row counts)
+  - `stride`, `truncated`, `server_time`
+  - `rows`, each with `id`, `device_id`, `timestamp` (+08:00), the raw and filtered values for each parameter, `sensor_status` and `water_quality`
+- Invalid dates or an unknown range return `400`.
+
+#### All Endpoints
+
+**WebSocket:** `/ws/aquasense`
+
+**Public:**
 
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/health` | System and data freshness status |
 | GET | `/api/config` | Public system configuration (see 6.2) |
-| GET | `/api/water/latest` | Latest reading |
-| GET | `/api/water/history` | Recent readings |
+| GET | `/api/water/latest` | Latest stored reading |
+| GET | `/api/water/history` | Latest 500 stored readings |
 | GET | `/api/water/readings` | Paginated, filtered readings (`from, to, session, quality, search, page, pageSize`) |
 | GET | `/api/water/summary` | Summary statistics for the same filters |
-| GET | `/api/water/series` | Chart series (`range=15m\|1h\|24h\|all\|custom, from, to, max`) |
+| GET | `/api/water/series` | Chart / history series (see above) |
 | GET | `/api/water/metrics` | Kalman Filter evaluation metrics (`from, to`) |
 | POST | `/api/auth/login` | Administrator login |
 
-**Admin endpoints (session required):**
+**Admin (session required):**
 
 | Method | Endpoint |
 |---|---|
@@ -440,7 +515,37 @@ These count received MQTT messages and valid readings, and track node status. Th
 | GET | `/api/admin/export`, `/api/admin/notifications`, `/api/admin/audit`, `/api/admin/system` |
 | POST | `/api/admin/telegram/test` |
 
-> The website's Telegram page also calls `POST /api/admin/notifications/:id/send` (resend) and `DELETE /api/admin/notifications/:id` (delete). These two endpoints are **not in the currently deployed Node-RED flow**, so those two actions will not work until the endpoints are added back.
+> The website's Telegram page also calls `POST /api/admin/notifications/:id/send` (resend) and `DELETE /api/admin/notifications/:id` (delete). These two endpoints are **not in the current Node-RED flow**, so those two actions do not work until the endpoints are added.
+
+### 6.13 Authentication
+
+- Passwords are hashed with **scrypt**, using the Node.js `crypto` module loaded into the function nodes. The stored format is `scrypt$N$r$p$<salt base64>$<key base64>`, with N = 16384, r = 8, p = 1 and a 64-byte key. Passwords are compared with `timingSafeEqual`.
+- Logging in creates a server-side session, sent as an **HttpOnly** cookie. The website never stores tokens or passwords.
+- Admin endpoints go through the **"auth guard"** link call, which returns `401` without a valid session.
+
+### 6.14 Placeholders in the Published Flow
+
+Before publishing, these values in `aquasense_flows.json` were replaced. Only the published copy changed; the flow logic is identical to the deployed flow.
+
+| Placeholder | Location | Replace with |
+|---|---|---|
+| `YOUR_MQTT_BROKER_IP` | `mqtt-broker` config node "Mosquitto AquaSense" | IP address or host name of your MQTT broker |
+| `YOUR_TELEGRAM_CHAT_ID` | `telegram bot` config node and the functions "Prepare Telegram", "Replay: plan & send" and "Telegram: test message" | Telegram chat ID that should receive the notifications |
+| `YOUR_INITIAL_ADMIN_SCRYPT_HASH` | function "Setup: next statement" (`INITIAL_ADMIN_HASH`) | scrypt hash of the initial admin password (see [8.2](#82-node-red)) |
+
+The export never contains Node-RED credentials. The Telegram bot token and the MySQL and MQTT usernames and passwords must be entered in the configuration nodes after import.
+
+### 6.15 Dependencies
+
+| Package / module | Nodes used in the flow |
+|---|---|
+| Node-RED core | `mqtt in`, `mqtt-broker`, `json`, `function`, `switch`, `inject`, `debug`, `http in`, `http response`, `websocket out`, `websocket-listener`, `link in`, `link out`, `link call`, `catch`, `status`, `comment` |
+| `node-red-node-mysql` | `mysql`, `MySQLdatabase` |
+| `node-red-contrib-telegrambot` | `telegram sender`, `telegram bot` |
+| `node-red-dashboard` | `ui_base`, `ui_tab`, `ui_group`, `ui_text` (one "Water Quality" text widget; it is not wired to the pipeline) |
+| Node.js `crypto` | Loaded as a module in the authentication function nodes |
+
+`node-red-dashboard` must be installed even though the website, not the Node-RED dashboard, is the user interface. Without it, the `ui_*` nodes show as unknown types and the flow cannot be deployed.
 
 ---
 
@@ -482,7 +587,7 @@ All `/admin/*` routes require a valid login session.
 | `/admin/history` | Monitoring History | History with CSV / Excel export |
 | `/admin/kalman` | Kalman Filter Analysis | See 7.4 |
 | `/admin/integration` | System Integration | Status of ESP32, MQTT, Node-RED, MySQL, WebSocket and Telegram |
-| `/admin/telegram` | Telegram Notification | Notification history and test message (resend and delete are described in the note in 6.7) |
+| `/admin/telegram` | Telegram Notification | Notification history and test message (resend and delete are described in the note in 6.12) |
 | `/admin/settings` | Settings | System configuration information and theme setting |
 | `/admin/profile` | Profile | Admin profile, profile photo and password change |
 
@@ -515,17 +620,45 @@ Start the parts in this order: **MQTT broker and MySQL → Node-RED → ESP32 �
 ### 8.1 MQTT Broker and MySQL
 
 1. Install and start an MQTT broker (the project uses **Mosquitto**) on port `1883`, reachable from the ESP32's WiFi network.
-2. Install MySQL and create the `aquasense` database with the `water_quality` table (see [6.5](#65-database)). The other tables are created by Node-RED.
+2. Install MySQL and create the `aquasense` database with the `water_quality` table (see [6.8](#68-mysql-storage)). The other tables are created by Node-RED.
 
 ### 8.2 Node-RED
 
-1. Install Node-RED and start it (default `http://localhost:1880`).
-2. Install the add-on nodes through **Manage palette**: `node-red-node-mysql`, `node-red-contrib-telegrambot` and `node-red-dashboard`.
-3. Import the AquaSense flow and set the credentials in the configuration nodes:
-   - MQTT broker address
-   - MySQL user and password
-   - Telegram bot token and chat ID
-4. Click **Deploy**. On startup the flow loads its configuration and prepares the database tables.
+**Install and prepare**
+
+1. Install Node-RED (`npm install -g node-red`) and start it with `node-red`. The editor opens at `http://localhost:1880`.
+2. Install the add-on nodes through **Menu (☰) → Manage palette → Install**:
+   - `node-red-node-mysql`
+   - `node-red-contrib-telegrambot`
+   - `node-red-dashboard`
+3. Make sure `functionExternalModules: true` is set in Node-RED's `settings.js`. This is the default in recent versions, and the authentication function nodes need it to load the `crypto` module.
+
+**Import the flow**
+
+4. Go to **Menu (☰) → Import**, click **select a file to import**, choose `Node-RED/flows/aquasense_flows.json`, and click **Import**. The tabs **Aquasense** and **AquaSense API** appear.
+
+**Configure it** (double-click each node to edit it)
+
+5. **MQTT broker** — config node "Mosquitto AquaSense": replace `YOUR_MQTT_BROKER_IP` with your broker address (port `1883`). If your broker requires a login, enter it on the **Security** tab.
+6. **MySQL** — both MySQL configuration nodes (one named "MySQL AquaSense" and one unnamed): check host `127.0.0.1`, port `3306` and database `aquasense`, then enter the MySQL user and password.
+7. **Telegram:**
+   - In the "AquaSense Borikamase" `telegram bot` config node, enter the bot token and replace `YOUR_TELEGRAM_CHAT_ID` in the allowed chat IDs.
+   - Replace `YOUR_TELEGRAM_CHAT_ID` in the functions "Prepare Telegram", "Replay: plan & send" and "Telegram: test message".
+8. **Initial admin account** — only needed when the `users` table is still empty. In the function "Setup: next statement", replace `YOUR_INITIAL_ADMIN_SCRYPT_HASH` with the hash of a password you choose. This command produces a hash in the same format the flow uses:
+
+   ```bash
+   node -e "const c=require('crypto');const s=c.randomBytes(16);const k=c.scryptSync(process.argv[1],s,64,{N:16384,r:8,p:1});console.log(['scrypt',16384,8,1,s.toString('base64'),k.toString('base64')].join('$'))" "YourStrongPassword"
+   ```
+
+   The account is created with the username `admin`. Change the password after the first login (**Profile → Change Password**).
+
+**Run and check**
+
+9. Click **Deploy**. Then check that:
+   - "Set AquaSense config" shows the status `config loaded`,
+   - the MQTT input shows `connected`,
+   - the debug sidebar shows `Debug - Raw Data`, `Debug - Filtered Data` and `Debug - Quality` messages when the ESP32 publishes,
+   - `http://localhost:1880/api/health` returns `"success": true` with `"database": { "status": "connected" }`.
 
 ### 8.3 ESP32
 
@@ -592,10 +725,15 @@ None of these secrets are stored in this repository:
 |---|---|
 | WiFi SSID and password | `Main_AquaSense.ino` (placeholders in the repository) |
 | Google Apps Script URL | `Main_AquaSense.ino` (placeholder in the repository) |
-| MQTT broker credentials | Node-RED credential store |
-| MySQL user and password | Node-RED credential store |
-| Telegram bot token and chat ID | Node-RED |
+| MQTT broker address | Node-RED `mqtt-broker` config node (placeholder in the repository) |
+| MQTT broker credentials | Node-RED credential store (never included in the export) |
+| MySQL user and password | Node-RED credential store (never included in the export) |
+| Telegram bot token | Node-RED credential store (never included in the export) |
+| Telegram chat ID | Node-RED flow (placeholder in the repository) |
+| Initial admin password hash | Node-RED function "Setup: next statement" (placeholder in the repository) |
 | Administrator accounts | MySQL `users` table (passwords hashed with scrypt) |
+
+Node-RED's own credential file (`flows_cred.json`), `settings.js` and `.config.*.json` files are not part of this repository.
 
 ---
 
@@ -612,7 +750,8 @@ None of these secrets are stored in this repository:
 - **Fill in your own settings before running.** The firmware cannot connect to WiFi or log to Google Sheets until the placeholders are replaced. Also set `mqtt_server` to your own broker's IP address.
 - **Never commit real credentials.** Do not put real WiFi passwords, Google Apps Script URLs, tokens or other secrets in this repository, its documentation, or its commit history.
 - **The GitHub firmware differs from the deployed firmware.** The firmware on the device contains the real configuration values. The repository copy differs **only** in the three placeholder lines (`ssid`, `password` and `serverName`). Everything else is identical, including pins, MQTT, LCD, NTP, sensor formulas and status logic.
-- **Only the published copy was changed.** The placeholders were applied only to the copy uploaded to GitHub. The original local source files were not modified.
+- **Placeholders in the Node-RED flow.** `Node-RED/flows/aquasense_flows.json` uses `YOUR_MQTT_BROKER_IP`, `YOUR_TELEGRAM_CHAT_ID` and `YOUR_INITIAL_ADMIN_SCRYPT_HASH` (see [6.14](#614-placeholders-in-the-published-flow)). Otherwise it is identical to the deployed flow.
+- **Only the published copies were changed.** The placeholders were applied only to the copies uploaded to GitHub. The original local source files and the running Node-RED flow were not modified.
 - **Turbidity calibration happens at startup.** The ESP32 measures the clear-water reference once, when it starts.
 - **TDS temperature compensation uses a fixed 25 °C**, because the system has no temperature sensor.
 - **The ESP32 waits for WiFi and MQTT at startup.** It does not continue until both are connected, so check the Serial Monitor if it seems stuck.
